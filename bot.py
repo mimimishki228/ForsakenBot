@@ -137,6 +137,7 @@ async def assign_rest_role(user_id: int, role_name: str, expiry_date: str):
     except Exception as e:
         logging.error(f"Ошибка отправки в info-канал: {e}")
 
+# ---------- ИСПРАВЛЕННАЯ ФУНКЦИЯ ----------
 async def assign_staff_role(user_id: int, role_name: str, username: str):
     async with aiosqlite.connect("bot.db") as db:
         # Проверка лимита
@@ -149,13 +150,23 @@ async def assign_staff_role(user_id: int, role_name: str, username: str):
             count = (await cur.fetchone())[0]
         if count >= limit:
             return False
-        await db.execute("UPDATE staff_roles SET user_id=?, username=? WHERE role_name=? AND user_id IS NULL LIMIT 1",
-                         (user_id, username, role_name))
+
+        # Находим первую свободную запись (без user_id) и получаем её rowid
+        async with db.execute("SELECT rowid FROM staff_roles WHERE role_name=? AND user_id IS NULL LIMIT 1", (role_name,)) as cur:
+            row = await cur.fetchone()
+            if not row:
+                return False
+            rowid = row[0]
+
+        # Обновляем именно эту запись по rowid
+        await db.execute("UPDATE staff_roles SET user_id=?, username=? WHERE rowid=?", 
+                         (user_id, username, rowid))
         await db.execute("UPDATE users SET status='staff' WHERE user_id=?", (user_id,))
         await db.commit()
-    # Обновление info-канала: отправим обновлённое сообщение о стаффе
+    # Обновление info-канала
     await update_staff_info()
     return True
+# -----------------------------------------
 
 async def update_staff_info():
     async with aiosqlite.connect("bot.db") as db:
@@ -210,17 +221,11 @@ async def check_rest_expiry():
                 await bot.send_message(user_id, f"Ваша роль рест '{role_name}' истекла.")
             except:
                 pass
-        # Обновляем info-канал: удаляем просроченные записи
-        # Это требует знания message_id для каждой записи, поэтому в реальном коде храним их
-        # Для простоты здесь просто пропустим, либо нужно хранить связь.
 
 # ---------- Клавиатуры ----------
 def main_menu_keyboard(user_id: int):
     buttons = []
-    # Панель участника всегда доступна
     buttons.append([InlineKeyboardButton(text="👤 Панель участника", callback_data="panel_user")])
-    # Панель админа показываем только админам
-    # (проверку будем делать в колбэке, но можно и здесь)
     buttons.append([InlineKeyboardButton(text="🛠 Панель админа", callback_data="panel_admin")])
     buttons.append([InlineKeyboardButton(text="ℹ️ Info", url=INFO_CHANNEL_LINK)])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -311,7 +316,6 @@ async def cmd_start(message: Message):
     if await is_banned(user_id):
         await message.answer("Вы забанены в боте.")
         return
-    # Регистрируем пользователя, если его нет
     async with aiosqlite.connect("bot.db") as db:
         await db.execute("INSERT OR IGNORE INTO users (user_id, status) VALUES (?, 'none')", (user_id,))
         await db.commit()
@@ -342,14 +346,12 @@ async def cb_get_flood_link(callback: CallbackQuery):
 @dp.callback_query(F.data == "apply_flood")
 async def cb_apply_flood(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
-    # Проверка, открыты ли заявки
     async with aiosqlite.connect("bot.db") as db:
         async with db.execute("SELECT value FROM settings WHERE key='flood_open'") as cur:
             row = await cur.fetchone()
             if row and row[0] == '0':
                 await callback.answer("Заявки во флуд временно закрыты", show_alert=True)
                 return
-    # Проверка, не подавал ли уже
     if await get_user_status(user_id) == "pending_flood":
         await callback.answer("Вы уже подали заявку", show_alert=True)
         return
@@ -368,7 +370,7 @@ async def process_flood_application(message: Message, state: FSMContext):
     await message.answer("Ваша заявка отправлена. Ожидайте решения.")
     await state.clear()
 
-# Аналогично для rest и staff, но для краткости опущу полный код (реализуем ниже)
+# (Аналогичные обработчики для rest и staff – они не реализованы в полном объёме, но не влияют на ошибку)
 
 # ---------- Админ: просмотр заявок ----------
 @dp.callback_query(F.data == "admin_app_flood")
@@ -392,20 +394,13 @@ async def cb_admin_app_flood(callback: CallbackQuery):
 async def admin_reply(message: Message):
     if not await is_admin(message.from_user.id):
         return
-    # Определяем, на какую заявку отвечает
     original_msg = message.reply_to_message
-    # Здесь мы можем не знать ID заявки, но можем по тексту в сообщении
-    # Для простоты: проверяем текст команды
     text = message.text.strip()
     if text.startswith("Принять") or text.startswith("Отказать"):
-        # Разбираем команду для флуда: Принять,Роль,Эмодзи или Отказать
         parts = text.split(',')
         if len(parts) < 1:
             return
         action = parts[0].strip()
-        # Нужно найти заявку, на которую отвечает админ. Поскольку reply_to_message содержит текст анкеты,
-        # мы можем найти по user_id? Но reply_to_message может быть исходным сообщением с анкетой,
-        # у которого есть from_user. Тогда берём user_id из него.
         if original_msg.from_user:
             applicant_id = original_msg.from_user.id
         else:
@@ -417,10 +412,8 @@ async def admin_reply(message: Message):
                 return
             role_name = parts[1].strip()
             emoji = parts[2].strip()
-            # Проверяем, что роль существует и свободна
             if await check_flood_role_available(role_name):
                 await assign_flood_role(applicant_id, role_name, emoji)
-                # Удаляем заявку
                 async with aiosqlite.connect("bot.db") as db:
                     await db.execute("UPDATE flood_applications SET status='approved' WHERE user_id=? AND status='pending'",
                                      (applicant_id,))
@@ -443,7 +436,6 @@ async def admin_reply(message: Message):
                 pass
             await message.answer("Заявка отклонена.")
     elif "," in text and len(text.split(',')) == 2:
-        # Возможно, это заявка в рест: Роль,до даты
         parts = text.split(',')
         role_name = parts[0].strip()
         expiry = parts[1].strip()
@@ -462,7 +454,6 @@ async def admin_reply(message: Message):
                     pass
                 await message.answer("Заявка в рест одобрена.")
     elif text.startswith("Принять") and len(text.split(',')) == 3:
-        # Стафф: Принять,@username,роль
         parts = text.split(',')
         action = parts[0].strip()
         username = parts[1].strip()
@@ -479,8 +470,6 @@ async def admin_reply(message: Message):
                 else:
                     await message.answer("Лимит роли исчерпан или роль не найдена.")
 
-# (Аналогично для других категорий, но код уже длинный)
-
 # ---------- Обработка новых участников группы ----------
 @dp.message(F.new_chat_members)
 async def new_member(message: Message):
@@ -489,7 +478,6 @@ async def new_member(message: Message):
 
 # ---------- Запуск ----------
 async def on_startup():
-    # Создание таблиц
     async with aiosqlite.connect("bot.db") as db:
         await db.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -555,21 +543,18 @@ async def on_startup():
         CREATE TABLE IF NOT EXISTS banned_users (
             user_id INTEGER PRIMARY KEY
         )""")
-        # Вставляем владельцев
         for owner in OWNERS:
             await db.execute("INSERT OR IGNORE INTO owners (user_id) VALUES (?)", (owner,))
-        # Настройки по умолчанию (заявки открыты)
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('flood_open', '1')")
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('rest_open', '1')")
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('staff_open', '1')")
         await db.commit()
-    # Запуск фоновой задачи проверки рестов
     asyncio.create_task(rest_expiry_loop())
 
 async def rest_expiry_loop():
     while True:
         await check_rest_expiry()
-        await asyncio.sleep(3600)  # раз в час
+        await asyncio.sleep(3600)
 
 async def main():
     await on_startup()
